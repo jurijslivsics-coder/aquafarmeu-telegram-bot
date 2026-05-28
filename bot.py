@@ -40,6 +40,7 @@ MAX_CHUNKS_PER_FILE = 80
 MAX_TOTAL_CHUNKS = 320
 MAX_PDF_PAGES = 40
 MAX_TEXT_CHARS_PER_FILE = 120_000
+MAX_AUTO_PDF_BYTES = 5_000_000
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
@@ -89,6 +90,9 @@ class KnowledgeBase:
 
             text_chunks: list[tuple[str, str]] = []
             for file_path in files:
+                if should_skip_file(file_path):
+                    logger.warning("Skipping large PDF for free Render startup: %s", file_path.name)
+                    continue
                 logger.info("Reading knowledge file: %s", file_path.name)
                 try:
                     text = extract_text(file_path)
@@ -190,6 +194,10 @@ def find_knowledge_files() -> Iterable[Path]:
         ),
         key=lambda path: (priority.get(path.suffix.lower(), 99), path.stat().st_size, path.name.lower()),
     )
+
+
+def should_skip_file(path: Path) -> bool:
+    return path.suffix.lower() == ".pdf" and path.stat().st_size > MAX_AUTO_PDF_BYTES
 
 
 def file_fingerprint(files: list[Path]) -> list[dict[str, int | str]]:
