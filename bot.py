@@ -154,6 +154,7 @@ class KnowledgeBase:
 
 
 knowledge_base = KnowledgeBase()
+SEEN_UPDATE_IDS: set[int] = set()
 
 
 def find_knowledge_files() -> Iterable[Path]:
@@ -271,9 +272,10 @@ def is_allowed(update: Update) -> bool:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id if update.effective_user else "unknown"
     await update.message.reply_text(
-        "Hi. I am the AquaFarmEU project assistant.\n\n"
-        f"Your Telegram user ID is: {user_id}\n\n"
-        "Ask me a question about the project documents."
+        "Hello! I am the AquaFarmEU project assistant. You can ask me questions in English, Russian, or Latvian.\n\n"
+        "Здравствуйте! Я ассистент проекта AquaFarmEU. Вы можете задавать вопросы на английском, русском или латышском.\n\n"
+        "Sveiki! Esmu AquaFarmEU projekta asistents. Jūs varat uzdot jautājumus angļu, krievu vai latviešu valodā.\n\n"
+        f"Your Telegram user ID is: {user_id}"
     )
 
 
@@ -383,7 +385,12 @@ async def health(request: Request) -> PlainTextResponse:
 async def telegram_webhook(request: Request) -> PlainTextResponse:
     payload = await request.json()
     update = Update.de_json(payload, request.app.state.telegram_app.bot)
-    await request.app.state.telegram_app.process_update(update)
+    if update.update_id in SEEN_UPDATE_IDS:
+        return PlainTextResponse("ok")
+    SEEN_UPDATE_IDS.add(update.update_id)
+    if len(SEEN_UPDATE_IDS) > 1000:
+        SEEN_UPDATE_IDS.clear()
+    await request.app.state.telegram_app.update_queue.put(update)
     return PlainTextResponse("ok")
 
 
