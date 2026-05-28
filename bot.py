@@ -60,44 +60,54 @@ class Chunk:
 class KnowledgeBase:
     def __init__(self) -> None:
         self.chunks: list[Chunk] = []
+        self.loaded = False
+        self.loading_lock = asyncio.Lock()
 
     async def load(self) -> None:
-        files = list(find_knowledge_files())
-        if not files:
-            logger.warning("No knowledge files found in %s", KNOWLEDGE_DIR)
-            self.chunks = []
-            return
+        async with self.loading_lock:
+            files = list(find_knowledge_files())
+            if not files and not read_urls():
+                logger.warning("No knowledge files found in %s", KNOWLEDGE_DIR)
+                self.chunks = []
+                self.loaded = True
+                return
 
-        if self._load_cached_index(files):
-            logger.info("Loaded %s chunks from cache", len(self.chunks))
-            return
+            if self._load_cached_index(files):
+                logger.info("Loaded %s chunks from cache", len(self.chunks))
+                self.loaded = True
+                return
 
-        text_chunks: list[tuple[str, str]] = []
-        for file_path in files:
-            text = extract_text(file_path)
-            for chunk in split_text(text):
-                text_chunks.append((file_path.name, chunk))
+            text_chunks: list[tuple[str, str]] = []
+            for file_path in files:
+                logger.info("Reading knowledge file: %s", file_path.name)
+                text = extract_text(file_path)
+                for chunk in split_text(text):
+                    text_chunks.append((file_path.name, chunk))
 
-        for url in read_urls():
-            try:
-                text = await fetch_url_text(url)
-            except Exception:
-                logger.exception("Could not fetch URL: %s", url)
-                continue
-            for chunk in split_text(text):
-                text_chunks.append((url, chunk))
+            for url in read_urls():
+                try:
+                    logger.info("Reading knowledge URL: %s", url)
+                    text = await fetch_url_text(url)
+                except Exception:
+                    logger.exception("Could not fetch URL: %s", url)
+                    continue
+                for chunk in split_text(text):
+                    text_chunks.append((url, chunk))
 
-        if not text_chunks:
-            self.chunks = []
-            return
+            if not text_chunks:
+                self.chunks = []
+                self.loaded = True
+                return
 
-        embeddings = await embed_texts([text for _, text in text_chunks])
-        self.chunks = [
-            Chunk(source=source, text=text, embedding=embedding)
-            for (source, text), embedding in zip(text_chunks, embeddings)
-        ]
-        self._save_index(files)
-        logger.info("Built knowledge index with %s chunks", len(self.chunks))
+            logger.info("Embedding %s knowledge chunks", len(text_chunks))
+            embeddings = await embed_texts([text for _, text in text_chunks])
+            self.chunks = [
+                Chunk(source=source, text=text, embedding=embedding)
+                for (source, text), embedding in zip(text_chunks, embeddings)
+            ]
+            self._save_index(files)
+            self.loaded = True
+            logger.info("Built knowledge index with %s chunks", len(self.chunks))
 
     def search(self, query_embedding: list[float], limit: int = 5) -> list[Chunk]:
         if not self.chunks:
@@ -282,6 +292,17 @@ async def answer_question(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
+    if not knowledge_base.loaded:
+        await update.message.reply_text("I am loading the project documents. This can take a minute on the first run.")
+        try:
+            await knowledge_base.load()
+        except Exception:
+            logger.exception("Knowledge index failed to build")
+            await update.message.reply_text(
+                "I could not load the project documents. Please check the Render logs."
+            )
+            return
+
     if not knowledge_base.chunks:
         await update.message.reply_text(
             "I do not have project documents loaded yet. Add files to the knowledge folder and restart me."
@@ -327,10 +348,7 @@ async def answer_question(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def post_init(application: Application) -> None:
-    try:
-        await knowledge_base.load()
-    except Exception:
-        logger.exception("Knowledge index failed to build during startup")
+    logger.info("Bot started. Knowledge will be loaded on first question or /reload.")
 
 
 def build_app() -> Application:
@@ -349,8 +367,8 @@ def main() -> None:
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
-            url_path=TELEGRAM_BOT_TOKEN,
-            webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_BOT_TOKEN}",
+            url_path="telegram-webhook",
+            webhook_url=f"{WEBHOOK_URL}/telegram-webhook",
         )
     else:
         logger.info("Starting local polling")
