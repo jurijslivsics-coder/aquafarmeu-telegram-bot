@@ -36,6 +36,10 @@ ROOT = Path(__file__).parent
 KNOWLEDGE_DIR = ROOT / "knowledge"
 URLS_PATH = KNOWLEDGE_DIR / "urls.txt"
 INDEX_PATH = ROOT / "knowledge_index.json"
+MAX_CHUNKS_PER_FILE = 80
+MAX_TOTAL_CHUNKS = 320
+MAX_PDF_PAGES = 40
+MAX_TEXT_CHARS_PER_FILE = 120_000
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
@@ -86,25 +90,40 @@ class KnowledgeBase:
             text_chunks: list[tuple[str, str]] = []
             for file_path in files:
                 logger.info("Reading knowledge file: %s", file_path.name)
-                text = extract_text(file_path)
-                for chunk in split_text(text):
+                try:
+                    text = extract_text(file_path)
+                except Exception:
+                    logger.exception("Could not read knowledge file: %s", file_path.name)
+                    continue
+
+                file_chunks = split_text(text)[:MAX_CHUNKS_PER_FILE]
+                for chunk in file_chunks:
                     text_chunks.append((file_path.name, chunk))
+                logger.info("Added %s chunks from %s", len(file_chunks), file_path.name)
+                if len(text_chunks) >= MAX_TOTAL_CHUNKS:
+                    logger.info("Reached max total chunks limit: %s", MAX_TOTAL_CHUNKS)
+                    break
 
             for url in read_urls():
+                if len(text_chunks) >= MAX_TOTAL_CHUNKS:
+                    break
                 try:
                     logger.info("Reading knowledge URL: %s", url)
                     text = await fetch_url_text(url)
                 except Exception:
                     logger.exception("Could not fetch URL: %s", url)
                     continue
-                for chunk in split_text(text):
+                url_chunks = split_text(text)[:MAX_CHUNKS_PER_FILE]
+                for chunk in url_chunks:
                     text_chunks.append((url, chunk))
+                logger.info("Added %s chunks from %s", len(url_chunks), url)
 
             if not text_chunks:
                 self.chunks = []
                 self.loaded = True
                 return
 
+            text_chunks = text_chunks[:MAX_TOTAL_CHUNKS]
             logger.info("Embedding %s knowledge chunks", len(text_chunks))
             embeddings = await embed_texts([text for _, text in text_chunks])
             self.chunks = [
@@ -162,10 +181,14 @@ def find_knowledge_files() -> Iterable[Path]:
         return []
     extensions = {".txt", ".md", ".pdf", ".docx", ".xlsx"}
     ignored_names = {"README.md", "urls.txt", "urls.example.txt"}
+    priority = {".txt": 0, ".md": 1, ".docx": 2, ".xlsx": 3, ".pdf": 4}
     return sorted(
-        path
-        for path in KNOWLEDGE_DIR.rglob("*")
-        if path.suffix.lower() in extensions and path.name not in ignored_names
+        (
+            path
+            for path in KNOWLEDGE_DIR.rglob("*")
+            if path.suffix.lower() in extensions and path.name not in ignored_names
+        ),
+        key=lambda path: (priority.get(path.suffix.lower(), 99), path.stat().st_size, path.name.lower()),
     )
 
 
@@ -187,8 +210,7 @@ def extract_text(path: Path) -> str:
     if suffix in {".txt", ".md"}:
         return path.read_text(encoding="utf-8", errors="ignore")
     if suffix == ".pdf":
-        reader = PdfReader(str(path))
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
+        return extract_pdf_text(path)
     if suffix == ".docx":
         doc = Document(str(path))
         return "\n".join(paragraph.text for paragraph in doc.paragraphs)
@@ -207,6 +229,23 @@ def extract_xlsx_text(path: Path) -> str:
             if values:
                 parts.append(" | ".join(values))
     workbook.close()
+    return "\n".join(parts)
+
+
+def extract_pdf_text(path: Path) -> str:
+    reader = PdfReader(str(path))
+    parts = []
+    total_pages = len(reader.pages)
+    pages_to_read = min(total_pages, MAX_PDF_PAGES)
+    logger.info("Extracting first %s of %s pages from %s", pages_to_read, total_pages, path.name)
+
+    for page_number, page in enumerate(reader.pages[:pages_to_read], start=1):
+        page_text = page.extract_text() or ""
+        if page_text.strip():
+            parts.append(f"Page {page_number}\n{page_text}")
+        if sum(len(part) for part in parts) >= MAX_TEXT_CHARS_PER_FILE:
+            logger.info("Reached text limit for %s", path.name)
+            break
     return "\n".join(parts)
 
 
@@ -231,7 +270,7 @@ async def fetch_url_text(url: str) -> str:
         tag.decompose()
     title = soup.title.get_text(" ", strip=True) if soup.title else url
     body = soup.get_text("\n", strip=True)
-    return f"Page: {title}\nURL: {url}\n\n{body}"
+    return f"Page: {title}\nURL: {url}\n\n{body[:MAX_TEXT_CHARS_PER_FILE]}"
 
 
 def split_text(text: str, max_chars: int = 1600, overlap: int = 250) -> list[str]:
