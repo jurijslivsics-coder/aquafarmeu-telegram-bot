@@ -46,6 +46,7 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini")
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+USE_EMBEDDINGS = os.getenv("USE_EMBEDDINGS", "false").lower() == "true"
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
 
@@ -128,8 +129,12 @@ class KnowledgeBase:
                 return
 
             text_chunks = text_chunks[:MAX_TOTAL_CHUNKS]
-            logger.info("Embedding %s knowledge chunks", len(text_chunks))
-            embeddings = await embed_texts([text for _, text in text_chunks])
+            if USE_EMBEDDINGS:
+                logger.info("Embedding %s knowledge chunks", len(text_chunks))
+                embeddings = await embed_texts([text for _, text in text_chunks])
+            else:
+                logger.info("Using keyword search for %s knowledge chunks", len(text_chunks))
+                embeddings = [[] for _ in text_chunks]
             self.chunks = [
                 Chunk(source=source, text=text, embedding=embedding)
                 for (source, text), embedding in zip(text_chunks, embeddings)
@@ -138,9 +143,12 @@ class KnowledgeBase:
             self.loaded = True
             logger.info("Built knowledge index with %s chunks", len(self.chunks))
 
-    def search(self, query_embedding: list[float], limit: int = 5) -> list[Chunk]:
+    def search(self, query: str, query_embedding: list[float] | None = None, limit: int = 5) -> list[Chunk]:
         if not self.chunks:
             return []
+
+        if not USE_EMBEDDINGS or query_embedding is None or not self.chunks[0].embedding:
+            return self.keyword_search(query, limit=limit)
 
         query = np.array(query_embedding)
         scored: list[tuple[float, Chunk]] = []
@@ -151,6 +159,23 @@ class KnowledgeBase:
 
         scored.sort(key=lambda item: item[0], reverse=True)
         return [chunk for score, chunk in scored[:limit] if score > 0.2]
+
+    def keyword_search(self, query: str, limit: int = 5) -> list[Chunk]:
+        query_terms = normalize_terms(query)
+        if not query_terms:
+            return self.chunks[:limit]
+
+        scored: list[tuple[int, Chunk]] = []
+        for chunk in self.chunks:
+            chunk_terms = normalize_terms(chunk.text)
+            score = len(query_terms.intersection(chunk_terms))
+            if score:
+                scored.append((score, chunk))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        if scored:
+            return [chunk for _, chunk in scored[:limit]]
+        return self.chunks[:limit]
 
     def _load_cached_index(self, files: list[Path]) -> bool:
         if not INDEX_PATH.exists():
@@ -299,6 +324,16 @@ def split_text(text: str, max_chars: int = 1600, overlap: int = 250) -> list[str
     return chunks
 
 
+def normalize_terms(text: str) -> set[str]:
+    normalized = []
+    for character in text.lower():
+        if character.isalnum():
+            normalized.append(character)
+        else:
+            normalized.append(" ")
+    return {term for term in "".join(normalized).split() if len(term) >= 3}
+
+
 async def embed_texts(texts: list[str]) -> list[list[float]]:
     embeddings: list[list[float]] = []
     batch_size = 64
@@ -364,8 +399,10 @@ async def answer_question(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    query_embedding = (await embed_texts([question]))[0]
-    relevant_chunks = knowledge_base.search(query_embedding)
+    query_embedding = None
+    if USE_EMBEDDINGS:
+        query_embedding = (await embed_texts([question]))[0]
+    relevant_chunks = knowledge_base.search(question, query_embedding)
 
     if not relevant_chunks:
         await update.message.reply_text(
