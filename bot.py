@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -14,8 +15,13 @@ from docx import Document
 from openpyxl import load_workbook
 from openai import AsyncOpenAI
 from pypdf import PdfReader
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse
+from starlette.routing import Route
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+import uvicorn
 
 
 load_dotenv()
@@ -363,17 +369,49 @@ def main() -> None:
     app = build_app()
 
     if WEBHOOK_URL:
-        logger.info("Starting webhook on port %s", PORT)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path="telegram-webhook",
-            webhook_url=f"{WEBHOOK_URL}/telegram-webhook",
-        )
+        logger.info("Starting web server on port %s", PORT)
+        asyncio.run(run_web_server(app))
     else:
         logger.info("Starting local polling")
         app.run_polling()
 
 
+async def health(request: Request) -> PlainTextResponse:
+    return PlainTextResponse("ok")
+
+
+async def telegram_webhook(request: Request) -> PlainTextResponse:
+    payload = await request.json()
+    update = Update.de_json(payload, request.app.state.telegram_app.bot)
+    await request.app.state.telegram_app.process_update(update)
+    return PlainTextResponse("ok")
+
+
+async def run_web_server(telegram_app: Application) -> None:
+    await telegram_app.initialize()
+    await telegram_app.start()
+    await telegram_app.bot.set_webhook(f"{WEBHOOK_URL}/telegram-webhook")
+
+    web_app = Starlette(
+        routes=[
+            Route("/", health, methods=["GET"]),
+            Route("/telegram-webhook", telegram_webhook, methods=["POST"]),
+        ]
+    )
+    web_app.state.telegram_app = telegram_app
+
+    config = uvicorn.Config(web_app, host="0.0.0.0", port=PORT, log_level="info")
+    server = uvicorn.Server(config)
+    try:
+        await server.serve()
+    finally:
+        await telegram_app.stop()
+        await telegram_app.shutdown()
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        logger.exception("Fatal startup error")
+        sys.exit(1)
