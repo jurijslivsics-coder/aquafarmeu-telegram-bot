@@ -236,8 +236,13 @@ def split_text(text: str, max_chars: int = 1600, overlap: int = 250) -> list[str
 
 
 async def embed_texts(texts: list[str]) -> list[list[float]]:
-    response = await client.embeddings.create(model=OPENAI_EMBEDDING_MODEL, input=texts)
-    return [item.embedding for item in response.data]
+    embeddings: list[list[float]] = []
+    batch_size = 64
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start : start + batch_size]
+        response = await client.embeddings.create(model=OPENAI_EMBEDDING_MODEL, input=batch)
+        embeddings.extend(item.embedding for item in response.data)
+    return embeddings
 
 
 def is_allowed(update: Update) -> bool:
@@ -322,7 +327,10 @@ async def answer_question(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def post_init(application: Application) -> None:
-    await knowledge_base.load()
+    try:
+        await knowledge_base.load()
+    except Exception:
+        logger.exception("Knowledge index failed to build during startup")
 
 
 def build_app() -> Application:
